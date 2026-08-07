@@ -19,7 +19,7 @@
 | 4 | Cortex Search（非構造データ / RAG） | 2時間 |
 | 5 | Cortex Analyst（構造化データ / Text-to-SQL） | 3時間 |
 | 6 | Cortex Agents（エージェント基盤） | 3時間 |
-| 7 | **マルチエージェント（Agent Toolset）** | 2時間 |
+| 7 | **マルチエージェント（Agent Toolset / 階層型オーケストレーション）** | 4時間 |
 | 8 | コスト・運用・監視 | 1時間 |
 | 9 | 学習ロードマップ | — |
 
@@ -632,31 +632,91 @@ curl -X POST "$SNOWFLAKE_ACCOUNT_BASE_URL/api/v2/databases/CORTEX_LAB/schemas/CO
 
 ---
 
-## 7. マルチエージェント — Agent Toolset
+## 7. マルチエージェント — Agent Toolset と階層型オーケストレーション
 
-### 7.1 何が発表されたか（2026年7月時点）
+> **この章のゴール**
+> 1. Snowflake における「マルチエージェント」が指すものを 3 段階に切り分けて理解する
+> 2. 2026年7月発表の **Agent Toolset** の正確な挙動（＝ツール継承であって委譲ではない）を説明できる
+> 3. Agent Toolset を実際に構築し、落とし穴を自分で再現できる
+> 4. 「真の委譲」が必要な場合の階層型オーケストレーションを実装できる
+> 5. 案件要件からどのパターンを選ぶべきかを判断できる
 
-2026年7月21日の Snowflake 公式ブログ「Your Agents Are in Production. Now What?」で、Cortex Agents の運用系機能群が一括で発表されました。マルチエージェントに直結するのは **Agent Toolset** です。
+---
 
-| 機能 | ステータス（発表時点） | 概要 |
-|---|---|---|
-| **Agent Toolset** | パブリックプレビュー予定 | **他エージェントのツールを自エージェントの仕様から参照し、実行時に継承する** |
-| Skills Package | パブリックプレビュー予定 | スキル群を1オブジェクトにまとめ、単一 URI で参照 |
-| Tool Search | パブリックプレビュー予定 | 全ツール定義を事前ロードせず、推論時に必要な定義だけを検索・ロード |
-| Coding Agent | パブリックプレビュー予定 | CoCo と同じランタイムのコーディングエージェントを自アプリに組み込む |
-| Async Agent API | GA 予定 | 長時間ジョブをバックグラウンド実行し、`run_id` で後から結果取得 |
-| Code Execution Tool | パブリックプレビュー予定 | サンドボックス Python（3.12 / numpy・pandas 同梱）で PDF・PPT・グラフを生成 |
-| Interrupt and Resume | GA 予定 | 実行中エージェントの停止・軌道修正・再開 |
-| Partial Access | パブリックプレビュー予定 | 単一エージェントで権限レベルの異なるユーザーを同時にサーブ |
-| Versioning UI | パブリックプレビュー | 構成の世代管理・比較・ロールバック・昇格 |
+### 7.1 まず整理 — 「マルチエージェント」には 3 つのレベルがある
 
-> **注意**: ブログ末尾の「マルチエージェント宣言的オーケストレーションガイド」へのリンク（`.../cortex-agents/multi-agent`）は 2026-08-04 現在 404 です。**正式な仕様は `user-guide/snowflake-cortex/cortex-agents-toolsets` を参照**してください。プレビュー機能のため、自アカウントで利用可能かは Snowsight / `SHOW PARAMETERS` で必ず確認すること。
+この言葉は文脈によって指すものが違うため、議論が噛み合わなくなりがちです。Snowflake の文脈では次の 3 段階に分けて考えると混乱しません。
 
-### 7.2 Agent Toolset の実体 — 「ツール継承」であって「サブエージェント委譲」ではない
+```mermaid
+flowchart TB
+    subgraph LV1["レベル1 ─ 単一Agent × 複数ツール（Cortex Agents の標準機能・GA）"]
+        direction LR
+        A1["Agent"] --> T1["Cortex Analyst"]
+        A1 --> T2["Cortex Search"]
+        A1 --> T3["Custom tool"]
+    end
 
-**ここが最重要の理解ポイントです。** 名前から「親エージェントが子エージェントに仕事を丸投げする」構成を想像しがちですが、実際の挙動は異なります。
+    subgraph LV2["レベル2 ─ ツール定義の共有（Agent Toolset・プレビュー）"]
+        direction LR
+        B1["業務Agent A"] -.->|"参照"| BK["ツールキットAgent<br/>共通ツール群を保持"]
+        B2["業務Agent B"] -.->|"参照"| BK
+    end
 
-呼び出し側エージェントが `agent_toolset` ツールを持つリクエストを受けたとき、Snowflake は次を実行します。
+    subgraph LV3["レベル3 ─ エージェントへの委譲（階層型・自前実装）"]
+        direction LR
+        M["マスターAgent<br/>ルーティング専任"] -->|"UDF経由でREST呼び出し"| S1["財務Agent<br/>独自の指示・モデル"]
+        M -->|"UDF経由でREST呼び出し"| S2["営業Agent<br/>独自の指示・モデル"]
+    end
+
+    LV1 --> LV2 --> LV3
+
+    style LV1 fill:#e8f5e9,stroke:#28a745
+    style LV2 fill:#e3f2fd,stroke:#1976d2
+    style LV3 fill:#fff3cd,stroke:#ffc107
+```
+
+| レベル | 何が複数か | 実現手段 | 状態 | 難易度 |
+|---|---|---|---|---|
+| **1** | ツールが複数 | Cortex Agents 標準（`tools` に複数定義） | GA | ★☆☆ |
+| **2** | ツール定義の**所有者**が複数 | `agent_toolset` | パブリックプレビュー予定 | ★★☆ |
+| **3** | **推論する主体**が複数 | UDF + REST / MCP / 外部フレームワーク | 自前実装 | ★★★ |
+
+> **よくある誤解**: 「Cortex Agents は 1 体で完結するからマルチステップ処理には弱い」——これは誤りです。<br/>
+> レベル1の時点で、公式ドキュメントに明記されているとおりエージェントは**複雑な依頼をサブタスクに分解し、各サブタスクに適したツールを選び、結果を評価して次の行動を決める**ループを回します。「複数の LLM に分ける」必要があるのは、**ドメインごとに指示やモデルを変えたい**場合や、**チームごとにエージェントの所有権を分けたい**場合であって、単に処理が多段だからではありません。**まずレベル1で足りないかを検証してから、レベル2・3を検討してください。**
+
+---
+
+### 7.2 2026年7月発表の全体像
+
+2026年7月21日の公式ブログ「Your Agents Are in Production. Now What?」で、Cortex Agents の**運用系機能群**が一括発表されました。全体の位置づけを掴んでおくと、Agent Toolset が単独の機能ではなく「エージェントを組織規模で運用するための一連の施策」の一部であることが分かります。
+
+| 分類 | 機能 | ステータス（発表時点） | 解決する課題 |
+|---|---|---|---|
+| **Build** | **Agent Toolset** | パブリックプレビュー予定 | ツール定義の重複とドリフト |
+| Build | Skills Package | パブリックプレビュー予定 | スキルを 1 オブジェクト化し単一 URI で参照 |
+| Build | Tool Search | パブリックプレビュー予定 | 全ツール定義の事前ロードによるコンテキスト圧迫 |
+| Build | Coding Agent | パブリックプレビュー予定 | CoCo 相当のコーディング能力を自アプリに組み込む |
+| **Run** | Async Agent API | GA 予定 | 長時間ジョブで HTTP 接続を保持し続ける問題 |
+| Run | Code Execution Tool | パブリックプレビュー予定 | サンドボックス Python で PDF・PPT・グラフを生成 |
+| Run | Interrupt and Resume | GA 予定 | 実行中エージェントの停止・軌道修正・再開 |
+| Run | Partial Access | パブリックプレビュー予定 | 権限レベルの異なるユーザーを 1 エージェントでサーブ |
+| **Manage** | Versioning UI | パブリックプレビュー | 構成のドリフト、ロールバック手段の欠如 |
+
+> ⚠️ **公式リンクの注意点**: ブログ末尾の「マルチエージェントワークフローの宣言的オーケストレーションガイド」へのリンク（`.../snowflake-cortex/cortex-agents/multi-agent`）は 2026-08-04 時点で **404** です。
+> 正式仕様は **`user-guide/snowflake-cortex/cortex-agents-toolsets`** が唯一の情報源です。
+> また、ブログには「開発中・未 GA の機能に関する将来予測的記述を含む」旨の免責が明記されています。**プレビュー機能に依存する設計は、クライアントとリスク合意を取ってから**進めてください。
+
+---
+
+### 7.3 Agent Toolset の実体 — 「委譲」ではなく「継承」
+
+**この章で最も重要な理解ポイントです。**
+
+名前から「親エージェントが子エージェントに仕事を丸投げし、子が自分で考えて答えを返す」構成を想像しがちですが、実際の挙動は根本的に異なります。
+
+#### 7.3.1 実行時に何が起きるか
+
+呼び出し側エージェントが `agent_toolset` ツールを持つリクエストを受けたとき、Snowflake は次の 5 ステップを実行します。
 
 1. `tool_resources[<tool_name>].agent_name` を読み、参照先エージェントを特定
 2. 完全修飾名で解決し、**呼び出しユーザーのロール**で USAGE を認可
@@ -674,16 +734,20 @@ sequenceDiagram
     participant OR as オーケストレーター<br/>（LLM）
 
     U->>CA: 質問
-    CA->>SF: agent_toolset を検出
+    CA->>SF: 仕様内に agent_toolset を検出
     SF->>SF: tool_resources[name].agent_name を読む
-    SF->>RA: 完全修飾名で解決 ＋ 呼び出しユーザーのロールで USAGE 認可
-    RA-->>SF: tools / tool_resources のみ返す<br/>（models・instructions は返さない）
-    SF->>SF: 呼び出し側の実効構成に union（合成）
-    SF->>OR: 平坦化済みツール一覧を渡す<br/>（agent_toolset エントリは除去）
+    SF->>RA: 完全修飾名で解決＋呼び出しユーザーのロールで USAGE 認可
+    alt USAGE あり・参照先が存在する
+        RA-->>SF: tools / tool_resources のみ返す<br/>（models・instructions は返さない）
+        SF->>SF: 呼び出し側の実効構成に union（合成）
+    else USAGE なし・参照先が存在しない
+        RA-->>SF: ✕ サイレントにスキップ<br/>（エラーも注釈も出ない）
+    end
+    SF->>OR: 平坦化済みツール一覧を渡す<br/>（agent_toolset エントリは除去済み）
     OR-->>U: 回答
 ```
 
-**「委譲」ではなく「継承」であることを図で押さえる:**
+#### 7.3.2 イメージの修正
 
 ```mermaid
 flowchart LR
@@ -712,31 +776,108 @@ flowchart LR
     style DROP fill:#f8d7da,stroke:#dc3545,stroke-dasharray: 4 4
 ```
 
-**設計上の含意（実務で効く）:**
+#### 7.3.3 継承されるもの・されないもの
 
-- 参照先エージェントの **`instructions`（planning / response）や `models` は継承されない**。ドメイン固有の振る舞いを共有したい場合、Agent Toolset では実現できない
-- したがって Agent Toolset の正しい使いどころは **「共通ツールライブラリの一元管理」**。データアクセス層、標準検索連携、共通 MCP 設定などを「ツールキットエージェント」として定義し、複数エージェントから参照する
-- 参照先のツールが更新されると、参照している全エージェントに自動的に反映される（＝定義の重複とドリフトを排除できる）
+| 参照先エージェントの要素 | 継承 | 補足 |
+|---|:---:|---|
+| `tools`（ツール定義） | ✅ | これが本機能の目的 |
+| `tool_resources`（ツールが使うリソース定義） | ✅ | Semantic View 名、検索サービス名、ウェアハウス等も一緒に来る |
+| ネストされた `agent_toolset` | ✅ | 再帰的に展開される |
+| `models`（オーケストレーションモデル） | ❌ | 呼び出し側の設定が使われる |
+| `instructions.orchestration`（計画指示） | ❌ | **ドメイン固有のルーティング方針は共有できない** |
+| `instructions.response`（応答指示） | ❌ | トーン・言語・書式は共有できない |
+| `orchestration.budget` | ❌ | 呼び出し側の設定が使われる |
+| `sample_questions` | ❌ | — |
 
-### 7.3 実装方法
+**この表から導かれる設計上の結論:**
 
-#### パターン A: 共通ツールキットエージェントを定義して参照する（推奨）
+- Agent Toolset は **「共通ツールライブラリの一元管理」機構**である
+- 適する用途: 全社共通のデータアクセス層、標準の検索サービス連携、共通の MCP 設定、共通の Custom tool 群
+- 適さない用途: ドメイン別の応答トーンの共有、ドメイン別のルーティングロジックの共有、ドメイン別のモデル使い分け
+- 参照先のツールが更新されると、参照している**全エージェントに自動反映**される（＝重複とドリフトの排除）
+
+---
+
+### 7.4 なぜツール共有が必要なのか — Before / After
+
+エージェントが 1 体のうちは問題になりません。**3 体目から急速に破綻します。**
+
+```mermaid
+flowchart TB
+    subgraph BEFORE["Before ─ 各エージェントがツール定義を自前で持つ"]
+        direction TB
+        A1["CS Agent<br/>analyst定義 / search定義"]
+        A2["営業 Agent<br/>analyst定義 / search定義"]
+        A3["経営企画 Agent<br/>analyst定義 / search定義"]
+        SV["Semantic View 変更"]
+        SV -->|"手作業で反映"| A1
+        SV -->|"手作業で反映"| A2
+        SV -->|"反映漏れ 💥"| A3
+    end
+
+    subgraph AFTER["After ─ ツールキットAgentに集約"]
+        direction TB
+        B1["CS Agent"]
+        B2["営業 Agent"]
+        B3["経営企画 Agent"]
+        BK["ツールキット Agent<br/>analyst定義 / search定義"]
+        SV2["Semantic View 変更"]
+        SV2 -->|"1箇所だけ更新"| BK
+        BK -.->|"実行時に継承"| B1
+        BK -.->|"実行時に継承"| B2
+        BK -.->|"実行時に継承"| B3
+    end
+
+    style BEFORE fill:#fdecea,stroke:#dc3545
+    style AFTER fill:#e8f5e9,stroke:#28a745
+    style BK fill:#d4edda,stroke:#28a745,stroke-width:2px
+```
+
+**Before の具体的な痛み:**
+
+- Semantic View に列を追加 → 全エージェントの `tool_resources` を手で更新 → 1 つ漏れて回答が不整合になる
+- 検索サービスの `columns_and_descriptions` を改善 → 反映されたエージェントとされていないエージェントで精度が違う
+- どのエージェントがどのリソースを参照しているか、棚卸しの手段がない
+
+**After で得られるもの:**
+
+- 更新は 1 箇所。参照側は実行時に最新を取得するため、再デプロイ不要
+- ツールの「正」がどこにあるかが一意に定まる（ガバナンス上の価値が大きい）
+
+---
+
+### 7.5 実装ハンズオン — ステップバイステップ
+
+#### Step 0. 前提確認
 
 ```sql
--- ① 共通ツールキットエージェント（それ自体は直接使わなくてよい）
+-- プレビュー機能の利用可否・上限パラメータを確認
+SHOW PARAMETERS LIKE 'CORTEX_AGENT_TOOLSET%' IN ACCOUNT;
+-- CORTEX_AGENT_TOOLSET_MAX_DEPTH   … 既定 5
+-- CORTEX_AGENT_TOOLSET_MAX_AGENTS  … 既定 25
+```
+
+パラメータが表示されない場合、自アカウントでまだ有効化されていない可能性があります。Snowsight の Agents 画面や Snowflake 担当に確認してください。
+
+#### Step 1. ツールキットエージェントを作る
+
+**ポイント**: このエージェントは**直接ユーザーに使わせる必要はありません**。ツール定義の「置き場所」としてのみ機能します。したがって `instructions` や `models` を書く意味は（継承されないため）ほぼありません。
+
+```sql
 CREATE OR REPLACE AGENT cortex_lab.core.toolkit_agent
-  COMMENT = '全社共通のデータアクセスツール群'
+  COMMENT = '全社共通のデータアクセスツール群（直接利用はしない・参照専用）'
+  PROFILE = '{"display_name": "共通ツールキット", "color": "gray"}'
   FROM SPECIFICATION
 $$
 tools:
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
       name: "sales_analyst"
-      description: "受注・売上・顧客の数値集計"
+      description: "受注・売上・顧客に関する数値をSQLで集計する。金額・件数・推移の質問に使う。"
   - tool_spec:
       type: "cortex_search"
       name: "policy_search"
-      description: "社内規程・ポリシー文書の検索"
+      description: "社内規程・ポリシー・保証条件などの文書を検索する。"
 
 tool_resources:
   sales_analyst:
@@ -744,28 +885,61 @@ tool_resources:
     execution_environment:
       type: "warehouse"
       warehouse: "cortex_lab_wh"
+      query_timeout: 60
   policy_search:
     name: "cortex_lab.core.support_docs_svc"
     max_results: 5
+    title_column: "title"
+    id_column: "doc_id"
+    columns_and_descriptions:
+      body:
+        description: "文書の本文"
+        type: "string"
+        searchable: true
+        filterable: false
+      category:
+        description: "文書区分。policy / guide のいずれか。"
+        type: "string"
+        searchable: false
+        filterable: true
 $$;
+```
 
--- ② 業務エージェントから参照
+#### Step 2. 業務エージェントから参照する
+
+**ポイント**: 業務エージェント側には**そのドメイン固有の `instructions` を必ず書きます**（継承されないため）。ツールだけを借りてくる構図です。
+
+```sql
 CREATE OR REPLACE AGENT cortex_lab.core.cs_agent
   COMMENT = 'カスタマーサポート向けエージェント'
+  PROFILE = '{"display_name": "CSアシスタント", "color": "green"}'
   FROM SPECIFICATION
 $$
 models:
   orchestration: auto
 
+orchestration:
+  budget:
+    seconds: 60
+    tokens: 32000
+
 instructions:
-  response: "顧客対応担当者向けに、丁寧かつ簡潔な日本語で回答すること。"
-  orchestration: "規程に関する質問は必ず検索ツールを使い、根拠文書を引用すること。"
+  response: "顧客対応担当者向けに、丁寧かつ簡潔な日本語で回答すること。規程を引用する場合は文書名を明示すること。"
+  orchestration: |
+    返品・保証・規程に関する質問は policy_search を使い、必ず根拠文書を引用すること。
+    売上・件数・金額に関する質問は sales_analyst を使うこと。
+    チケット起票の依頼を受けた場合のみ create_ticket を使うこと。
+  sample_questions:
+    - question: "返品はいつまで受け付けていますか？"
+    - question: "この顧客の直近の受注金額は？"
 
 tools:
+  # 自分だけが持つローカルツール
   - tool_spec:
       type: "generic"
       name: "create_ticket"
       description: "サポートチケットを起票する"
+  # 共通ツールキットからの継承
   - tool_spec:
       type: "agent_toolset"
       name: "shared_tools"
@@ -782,7 +956,67 @@ tool_resources:
 $$;
 ```
 
+> `agent_toolset` の `name`（ここでは `shared_tools`）は **`tool_resources` のキーと一致していなければなりません**。`agent_name` は必ず `database.schema.agent_name` の完全修飾名で書きます。
+
+#### Step 3. 権限を付与する
+
+```sql
+-- 呼び出しユーザーのロールに、両方のエージェントへの USAGE が必要
+GRANT USAGE ON AGENT cortex_lab.core.cs_agent      TO ROLE cs_role;
+GRANT USAGE ON AGENT cortex_lab.core.toolkit_agent TO ROLE cs_role;
+GRANT USAGE ON DATABASE cortex_lab                 TO ROLE cs_role;
+GRANT USAGE ON SCHEMA   cortex_lab.core            TO ROLE cs_role;
+```
+
+| 権限 | 対象 | 用途 | 欠けたときの挙動 |
+|---|---|---|---|
+| USAGE | 呼び出し側エージェント | エージェントの実行 | 実行エラー |
+| USAGE | 参照先エージェント | ツールセットの展開 | **サイレントスキップ** |
+| USAGE | DB / スキーマ | 各エージェントへのアクセス | 同上 |
+
+#### Step 4. 動作確認
+
+Snowsight の **AI & ML » Agents » CS_AGENT » Playground** で、継承ツールを使うはずの質問を投げます。
+
+```
+「返品はいつまで受け付けていますか？」
+  → thinking ステップに policy_search（継承ツール）の呼び出しが出れば成功
+```
+
 REST API 版:
+
+```bash
+curl -X POST "$SNOWFLAKE_ACCOUNT_BASE_URL/api/v2/databases/CORTEX_LAB/schemas/CORE/agents/CS_AGENT:run" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $PAT" \
+  -d '{
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"返品はいつまで受け付けていますか？"}]}
+    ]
+  }'
+```
+
+#### Step 5. 複数のツールキットを参照する
+
+```yaml
+tools:
+  - tool_spec:
+      type: agent_toolset
+      name: analytics_tools
+  - tool_spec:
+      type: agent_toolset
+      name: communication_tools
+
+tool_resources:
+  analytics_tools:
+    agent_name: CORTEX_LAB.CORE.ANALYTICS_AGENT
+  communication_tools:
+    agent_name: CORTEX_LAB.CORE.COMMS_AGENT
+```
+
+`analytics_tools` が先に展開されます。ツール名が衝突した場合は**先に定義された方が勝ちます**（＝呼び出し側自身 → analytics → communication の優先順）。
+
+#### Step 6. REST API で作る場合
 
 ```bash
 curl -X POST "$SNOWFLAKE_ACCOUNT_BASE_URL/api/v2/databases/CORTEX_LAB/schemas/CORE/agents" \
@@ -803,156 +1037,404 @@ curl -X POST "$SNOWFLAKE_ACCOUNT_BASE_URL/api/v2/databases/CORTEX_LAB/schemas/CO
   }'
 ```
 
-#### パターン B: 複数エージェントを参照する
+---
 
-```yaml
-tools:
-  - tool_spec:
-      type: agent_toolset
-      name: analytics_tools
-  - tool_spec:
-      type: agent_toolset
-      name: communication_tools
-
-tool_resources:
-  analytics_tools:
-    agent_name: CORTEX_LAB.CORE.ANALYTICS_AGENT
-  communication_tools:
-    agent_name: CORTEX_LAB.CORE.COMMS_AGENT
-```
-
-`analytics_tools` が先に展開されます。名前が衝突した場合は**先に定義されたものが勝ちます**。
-
-### 7.4 仕様の詳細（テスト観点になる箇所）
+### 7.6 仕様の詳細（レビュー・テスト観点）
 
 | 項目 | 挙動 |
 |---|---|
-| **名前衝突** | 呼び出し側エージェント自身の定義が最優先。継承ツールをローカルで上書きできる（参照先を変更せずにオーバーライド可能） |
+| **名前衝突** | 呼び出し側エージェント自身の定義が最優先。継承ツールをローカルで上書きできる（参照先を変更せずオーバーライド可能） |
 | **再帰展開** | 参照先がさらに `agent_toolset` を持つ場合、再帰的に展開される |
-| **循環検出** | 訪問済み集合を用いた DFS で検出。A → B → A の循環は**実行エラー** |
-| **最大ネスト深度** | 5 階層（アカウントパラメータ `CORTEX_AGENT_TOOLSET_MAX_DEPTH` で変更可） |
-| **最大参照数** | 1 実行あたり 25 エージェント（`CORTEX_AGENT_TOOLSET_MAX_AGENTS` で変更可） |
-| **権限不足 / 参照先不在** | **サイレントにスキップされる。エラーも注釈も出ず、呼び出し側自身のツールだけで実行が成功する** |
+| **循環検出** | 訪問済み集合を用いた深さ優先探索で検出。A → B → A の循環は**実行エラー** |
+| **最大ネスト深度** | 5 階層。アカウントパラメータ `CORTEX_AGENT_TOOLSET_MAX_DEPTH` で変更可 |
+| **最大参照数** | 1 実行あたり 25 エージェント。`CORTEX_AGENT_TOOLSET_MAX_AGENTS` で変更可 |
+| **上限超過** | 実行エラー |
+| **権限不足 / 参照先不在** | **サイレントにスキップ**。エラーも注釈も出ず、呼び出し側自身のツールだけで実行が成功する |
 | **部分展開なし** | 参照先が解決できない場合、そのエージェントのツールは**全て**落ちる。一部だけ継承されることはない |
-| **作成時バリデーション** | 構造のみ検証（`name` があるか、`agent_name` が空でないか）。参照先の解決・認可は行わない |
+| **作成時バリデーション** | 構造のみ検証（`name` の有無、`tool_resources[<name>].agent_name` が空でないか）。参照先の解決・認可は行わない |
 | **解決タイミング** | **実行時**。参照先はエージェント作成時に存在していなくてよい。作成順序を気にせず権限を後付けできる |
+| **オーケストレーターから見た姿** | `agent_toolset` エントリは見えない。フラットに展開されたツール一覧だけが渡される |
 
-**必要な権限:**
+---
 
-| 権限 | 対象 | 用途 |
-|---|---|---|
-| USAGE | 呼び出し側エージェント | エージェントの実行 |
-| USAGE | 参照先エージェント | ツールセットの展開（無い場合はサイレントスキップ） |
-| USAGE | DB / スキーマ | 各エージェントが存在する DB・スキーマへのアクセス |
-
-### 7.5 実務で必ず設計に織り込むべきリスク
-
-> ⚠️ **サイレントスキップが最大の落とし穴です。**
-> 参照先が削除された、または権限が revoke された場合、エージェントは**エラーを返さずに、ツールが減った状態で動き続けます**。ユーザーから見ると「昨日まで答えられていた質問に、今日は答えられない（しかし失敗はしていない）」という不可解な挙動になります。
-
-対策として実装すべきこと:
-
-1. **デプロイ時のプリフライトチェック** — CI/CD で参照先エージェントの存在と USAGE 付与を検証する
-   ```sql
-   SHOW AGENTS LIKE 'TOOLKIT_AGENT' IN SCHEMA CORTEX_LAB.CORE;
-   SHOW GRANTS ON AGENT CORTEX_LAB.CORE.TOOLKIT_AGENT;
-   ```
-2. **カナリアクエリの定期実行** — 継承ツールを必ず使うはずの質問を定期投入し、ツール呼び出しイベントが発生しているかを監視する
-3. **評価（Evaluations）の CI 組み込み** — Cortex Agent evaluations でシステムメトリクスの回帰を検知する
-4. **参照先の DROP を禁止する運用** — `CREATE OR REPLACE` ではなく `ALTER AGENT ... MODIFY LIVE VERSION` を使い、オブジェクトの同一性を保つ
-
-### 7.6 「真の」マルチエージェント委譲が必要な場合の代替パターン
-
-Agent Toolset はツール共有のための機能であり、**子エージェントに独自の指示・モデルで推論させたい**場合は別のパターンが必要です。
-
-| パターン | 概要 | 使いどころ |
-|---|---|---|
-| **A. UDF 経由の階層型オーケストレーション** | 子エージェントの `agent:run` を呼ぶ Python UDF を作り、それを親エージェントの Custom tool として登録する。マスターエージェントがドメイン別サブエージェントにルーティングする | 各ドメインで指示・モデル・トーンを変えたい場合。Snowflake の Developer Guides に公式のテンプレートあり |
-| **B. MCP 経由** | 子エージェントを MCP サーバとして公開し、親が MCP connector で呼ぶ | Snowflake 外のオーケストレーター（例: Microsoft AI Foundry）と組み合わせる場合 |
-| **C. 外部フレームワーク** | LangGraph などの Supervisor アーキテクチャから Cortex Agents を呼ぶ | 複雑な状態遷移・条件分岐が必要な場合 |
-| **D. A2A プロトコル** | Cortex Agent を A2A ラッパー経由で公開し、他ベンダーのエージェントと相互運用 | マルチベンダー環境 |
-
-**パターン A の骨格（UDF による子エージェント呼び出し）:**
-
-```sql
--- 1) 外部アクセス設定
-CREATE OR REPLACE NETWORK RULE cortex_agent_egress_rule
-  MODE = EGRESS TYPE = HOST_PORT
-  VALUE_LIST = ('<your_account>.snowflakecomputing.com');
-
-CREATE OR REPLACE SECRET cortex_agent_token
-  TYPE = GENERIC_STRING SECRET_STRING = '<PAT>';
-
-CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION cortex_agent_eai
-  ALLOWED_NETWORK_RULES = (cortex_agent_egress_rule)
-  ALLOWED_AUTHENTICATION_SECRETS = (cortex_agent_token)
-  ENABLED = TRUE;
-
--- 2) 子エージェントを呼ぶ UDF
-CREATE OR REPLACE FUNCTION ask_finance_agent(user_query VARCHAR)
-RETURNS STRING
-LANGUAGE PYTHON RUNTIME_VERSION = '3.12'
-PACKAGES = ('requests')
-EXTERNAL_ACCESS_INTEGRATIONS = (cortex_agent_eai)
-SECRETS = ('token' = cortex_agent_token)
-HANDLER = 'run_agent'
-AS $$
-import _snowflake, requests, json
-
-def run_agent(user_query):
-    token = _snowflake.get_generic_secret_string('token')
-    url = ("https://<your_account>.snowflakecomputing.com"
-           "/api/v2/databases/CORTEX_LAB/schemas/CORE/agents/FINANCE_AGENT:run")
-    resp = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/json"},
-        json={"stream": False,
-              "messages": [{"role": "user",
-                            "content": [{"type": "text", "text": user_query}]}]},
-        timeout=300,
-    )
-    resp.raise_for_status()
-    return json.dumps(resp.json(), ensure_ascii=False)
-$$;
-
--- 3) 親エージェントに Custom tool として登録
---    tools: [{tool_spec: {type: "generic", name: "finance_agent", ...}}]
---    tool_resources: {finance_agent: {type: "function",
---                     identifier: "CORTEX_LAB.CORE.ASK_FINANCE_AGENT", ...}}
-```
-
-> ⚠️ このパターンでは PAT をシークレットとして保持するため、**呼び出し元ユーザーの RBAC ではなく PAT 所有者の権限で子エージェントが動きます**。行レベルセキュリティを前提とした案件では、Partial Access やマルチテナンシー機能の GA を待つか、テナント値をセッション属性として渡す設計に切り替えてください。
-
-### 7.7 判断フローチャート
+### 7.7 落とし穴カタログ
 
 ```mermaid
 flowchart TD
-    Q{"複数のエージェント構成が必要か"}
+    S["継承ツールが使われない"] --> Q1{"参照先Agentは<br/>存在するか"}
+    Q1 -->|"No"| R1["サイレントスキップ<br/>→ SHOW AGENTS で確認"]
+    Q1 -->|"Yes"| Q2{"呼び出しユーザーのロールに<br/>参照先の USAGE があるか"}
+    Q2 -->|"No"| R2["サイレントスキップ<br/>→ SHOW GRANTS で確認"]
+    Q2 -->|"Yes"| Q3{"ツール名が<br/>衝突していないか"}
+    Q3 -->|"衝突"| R3["ローカル定義が優先されている<br/>→ 名前を変える"]
+    Q3 -->|"OK"| Q4{"深度5 / 25エージェントの<br/>上限を超えていないか"}
+    Q4 -->|"超過"| R4["実行エラー<br/>→ パラメータ調整 or 構成見直し"]
+    Q4 -->|"OK"| Q5{"orchestration 指示で<br/>ツールを使うよう誘導しているか"}
+    Q5 -->|"No"| R5["LLM がツールを選ばない<br/>→ instructions を明示的に書く"]
 
-    Q -->|"ツール定義の重複を解消したいだけ"| A["Agent Toolset<br/>type: agent_toolset<br/>★最もシンプル・低コスト"]
-    Q -->|"スキル（指示＋スクリプト）を共有したい"| B["Skills Package<br/>単一URIでスキル群を参照"]
-    Q -->|"ドメインごとに指示・モデル・トーンを変えたい"| C["階層型オーケストレーション<br/>UDF経由で子Agentを呼ぶ<br/>パターンA"]
+    style R1 fill:#f8d7da,stroke:#dc3545
+    style R2 fill:#f8d7da,stroke:#dc3545
+    style R3 fill:#fff3cd,stroke:#ffc107
+    style R4 fill:#fff3cd,stroke:#ffc107
+    style R5 fill:#fff3cd,stroke:#ffc107
+```
+
+| # | 症状 | 原因 | 対策 |
+|---|---|---|---|
+| 1 | **エラーは出ないのに回答できない** | 参照先の削除／権限 revoke によるサイレントスキップ | デプロイ時のプリフライトチェック＋カナリアクエリ（下記） |
+| 2 | 継承したはずのツールが呼ばれない | ローカルの同名ツールに上書きされている | ツール名に接頭辞を付ける規約（例: `shared_analyst`） |
+| 3 | 実行がエラーで落ちる | 循環参照、または深度・参照数の上限超過 | 参照グラフを設計書で管理し、ネストは 2 階層までに抑える |
+| 4 | ドメイン固有のトーンが効かない | `instructions` は継承されないと理解していない | 業務エージェント側に必ず `instructions` を書く |
+| 5 | 検証環境で動いたのに本番で動かない | 環境ごとにエージェント名／権限が異なる | `agent_name` を環境変数化し、CI で置換する |
+
+#### サイレントスキップへの対策実装
+
+> ⚠️ **これが Agent Toolset 最大のリスクです。**
+> 参照先が削除された、または権限が revoke された場合、エージェントは**エラーを返さずにツールが減った状態で動き続けます**。ユーザーから見ると「昨日まで答えられていた質問に今日は答えられない。しかし失敗もしていない」という切り分けが極めて困難な事象になります。
+
+**① デプロイ時のプリフライトチェック（CI に組み込む）**
+
+```sql
+-- 参照先エージェントの存在確認
+SHOW AGENTS LIKE 'TOOLKIT_AGENT' IN SCHEMA CORTEX_LAB.CORE;
+SELECT COUNT(*) AS agent_exists FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+-- 0 件ならデプロイを失敗させる
+
+-- 権限付与の確認
+SHOW GRANTS ON AGENT CORTEX_LAB.CORE.TOOLKIT_AGENT;
+SELECT COUNT(*) AS grant_exists
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "privilege" = 'USAGE' AND "grantee_name" = 'CS_ROLE';
+-- 0 件ならデプロイを失敗させる
+```
+
+**② カナリアクエリの定期実行**
+
+継承ツールを必ず使うはずの質問を定期投入し、ツール呼び出しイベントが発生しているかを監視します。`agent:run` のレスポンスイベントに該当ツールの `tool_use` が含まれない場合にアラートを上げる、という実装が現実的です。
+
+**③ 評価（Evaluations）の CI 組み込み**
+
+Cortex Agent evaluations で評価データセットを作り、システムメトリクスの回帰を検知します。Snowsight の Evaluations タブでは各メトリクスの平均スコア・前回比・推移が確認できます。
+
+**④ 参照先オブジェクトの同一性を保つ運用**
+
+`CREATE OR REPLACE AGENT` はオブジェクトを作り直すため、付与済みの権限が失われる可能性があります。更新は `ALTER AGENT <name> MODIFY LIVE VERSION SET SPECIFICATION = $$...$$` を使い、Versioning UI で世代管理してください。
+
+---
+
+### 7.8 パターンA — 階層型オーケストレーション（真の委譲）
+
+ドメインごとに**独自の指示・モデル・トーン**を持つサブエージェントに委譲したい場合、Agent Toolset では実現できません。Snowflake の Developer Guides に公式のテンプレートがある「UDF 経由の階層型オーケストレーション」を使います。
+
+> 公式ガイドにも「このアプローチは、Snowflake がマルチエージェントワークフローのネイティブサポートを追加するにつれて変化する可能性がある」旨の注記があります。**現時点での回避策**という位置づけで採用してください。
+
+#### 7.8.1 アーキテクチャ
+
+```mermaid
+flowchart LR
+    U(["ユーザー"]) --> M
+
+    subgraph SF["Snowflake アカウント内"]
+        M["マスター Agent<br/>ルーティング専任<br/>自分では答えない"]
+        UDF1["UDF: ASK_FINANCE_AGENT<br/>Python / requests"]
+        UDF2["UDF: ASK_SALES_AGENT<br/>Python / requests"]
+        S1["財務 Agent<br/>独自の instructions・model<br/>Analyst + Search"]
+        S2["営業 Agent<br/>独自の instructions・model<br/>Analyst + Search"]
+
+        M -->|"Custom tool として呼ぶ"| UDF1
+        M -->|"Custom tool として呼ぶ"| UDF2
+        UDF1 -->|"REST: agent:run<br/>SSE を解析"| S1
+        UDF2 -->|"REST: agent:run<br/>SSE を解析"| S2
+    end
+
+    EAI["External Access Integration<br/>Network Rule + Secret（PAT）"] -.->|"外部通信を許可"| UDF1
+    EAI -.-> UDF2
+
+    style M fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style S1 fill:#e8f5e9,stroke:#28a745
+    style S2 fill:#e8f5e9,stroke:#28a745
+    style EAI fill:#fff3cd,stroke:#ffc107
+```
+
+| コンポーネント | 役割 |
+|---|---|
+| Network Rule | Snowflake API への EGRESS 通信を許可 |
+| Secret | PAT（Personal Access Token）を安全に保持 |
+| External Access Integration | ネットワークルールとシークレットを UDF に橋渡し |
+| UDF（Python） | サブエージェントの REST API を呼び、SSE レスポンスを解析 |
+| マスター Agent | Custom tool 経由でサブエージェントにルーティング |
+
+#### 7.8.2 実装
+
+**Step 1: PAT を発行**
+
+Snowflake UI の User Menu » My Profile » Authentication » Generate Token。**PAT には有効期限があります。失効管理を運用に組み込んでください。**
+
+**Step 2: インフラ設定**
+
+```sql
+USE ROLE ACCOUNTADMIN;
+
+-- ① Snowflake API への EGRESS を許可するネットワークルール
+CREATE OR REPLACE NETWORK RULE cortex_agent_egress_rule
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ('<YOUR_ACCOUNT>.snowflakecomputing.com');
+
+-- ② PAT をシークレットとして保存
+CREATE OR REPLACE SECRET cortex_agent_token_secret
+  TYPE = GENERIC_STRING
+  SECRET_STRING = '<YOUR_PAT_TOKEN>';
+
+-- ③ 外部アクセス統合
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION cortex_agent_external_access
+  ALLOWED_NETWORK_RULES = (cortex_agent_egress_rule)
+  ALLOWED_AUTHENTICATION_SECRETS = (cortex_agent_token_secret)
+  ENABLED = TRUE;
+
+-- ④ 実行ロールへの権限付与
+GRANT READ  ON SECRET      cortex_agent_token_secret     TO ROLE <YOUR_ROLE>;
+GRANT USAGE ON INTEGRATION cortex_agent_external_access  TO ROLE <YOUR_ROLE>;
+```
+
+**Step 3: サブエージェント呼び出し UDF**
+
+`agent:run` は既定で SSE（Server-Sent Events）ストリーミングを返すため、UDF 側でストリームを解析してテキストを組み立てる必要があります。
+
+```sql
+CREATE OR REPLACE FUNCTION ask_finance_agent(user_query VARCHAR)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.12'
+PACKAGES = ('requests')
+EXTERNAL_ACCESS_INTEGRATIONS = (cortex_agent_external_access)
+SECRETS = ('agent_token' = cortex_agent_token_secret)
+HANDLER = 'run_agent'
+AS
+$$
+import _snowflake, requests, json
+
+ACCOUNT  = "<YOUR_ACCOUNT>"
+DATABASE = "CORTEX_LAB"
+SCHEMA   = "CORE"
+AGENT    = "FINANCE_AGENT"
+
+def run_agent(user_query):
+    # ① シークレットから PAT を取得
+    try:
+        token = _snowflake.get_generic_secret_string('agent_token')
+    except Exception as e:
+        return f"Error: シークレットを読めません。GRANT READ ON SECRET を確認してください。詳細: {e}"
+
+    url = (f"https://{ACCOUNT}.snowflakecomputing.com"
+           f"/api/v2/databases/{DATABASE}/schemas/{SCHEMA}/agents/{AGENT}:run")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    payload = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": user_query}]}
+        ]
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, stream=True, timeout=300)
+        if resp.status_code != 200:
+            return f"API Error {resp.status_code}: {resp.text}"
+
+        # ② SSE ストリームを解析し、テキストデルタだけを結合する
+        chunks, current_event = [], None
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode('utf-8')
+            if line.startswith('event: '):
+                current_event = line[7:].strip()
+            elif line.startswith('data: '):
+                body = line[6:]
+                if body == '[DONE]':
+                    break
+                try:
+                    data = json.loads(body)
+                    if current_event == 'response.text.delta' and 'text' in data:
+                        chunks.append(data['text'])
+                except json.JSONDecodeError:
+                    continue
+
+        return "".join(chunks) if chunks else "サブエージェントがテキストを返しませんでした。"
+
+    except Exception as e:
+        return f"Connection error: {e}"
+$$;
+```
+
+サブエージェントごとに同じ UDF を複製し、**`AGENT` 定数だけを変えます**。
+
+```sql
+-- 直接テストできる（デバッグに有用）
+SELECT ask_finance_agent('今期の粗利率の推移は？');
+```
+
+**Step 4: マスターエージェントに Custom tool として登録**
+
+```sql
+CREATE OR REPLACE AGENT cortex_lab.core.master_agent
+  COMMENT = 'ドメイン別サブエージェントへのルーティング専任エージェント'
+  FROM SPECIFICATION
+$$
+models:
+  orchestration: auto
+
+instructions:
+  orchestration: |
+    あなたはインテリジェントなルーターです。ユーザーの質問を分析し、適切なドメインを判定してください。
+
+    finance_agent: 粗利・原価・予算・財務指標に関する質問に使う。
+    sales_agent  : 受注・売上・顧客・パイプラインに関する質問に使う。
+
+    ルール: 自分で回答を作らないこと。必ず適切なツールを呼び出して回答を取得すること。
+    どちらのドメインか判断できない場合は、ユーザーに確認すること。
+  response: "サブエージェントの回答をそのまま尊重し、どのドメインの回答かを冒頭に明記すること。"
+
+tools:
+  - tool_spec:
+      type: "generic"
+      name: "finance_agent"
+      description: "財務ドメインの専門エージェント。粗利・原価・予算に関する質問を委譲する。"
+      input_schema:
+        type: "object"
+        properties:
+          user_query:
+            type: "string"
+            description: "サブエージェントに渡す質問文"
+        required: ["user_query"]
+  - tool_spec:
+      type: "generic"
+      name: "sales_agent"
+      description: "営業ドメインの専門エージェント。受注・売上・顧客に関する質問を委譲する。"
+      input_schema:
+        type: "object"
+        properties:
+          user_query:
+            type: "string"
+            description: "サブエージェントに渡す質問文"
+        required: ["user_query"]
+
+tool_resources:
+  finance_agent:
+    type: "function"
+    identifier: "CORTEX_LAB.CORE.ASK_FINANCE_AGENT"
+    execution_environment:
+      type: "warehouse"
+      warehouse: "cortex_lab_wh"
+  sales_agent:
+    type: "function"
+    identifier: "CORTEX_LAB.CORE.ASK_SALES_AGENT"
+    execution_environment:
+      type: "warehouse"
+      warehouse: "cortex_lab_wh"
+$$;
+```
+
+#### 7.8.3 このパターンの制約（案件で必ず説明すべき点）
+
+| 制約 | 内容 | 影響 |
+|---|---|---|
+| **RBAC の断絶** | UDF は PAT をシークレットとして使うため、**呼び出しユーザーの権限ではなく PAT 所有者の権限**でサブエージェントが動く | 行レベルセキュリティ前提の案件では**そのまま採用不可**。Partial Access／マルチテナンシーの GA を待つか、テナント値をセッション属性として渡す設計に切り替える |
+| **可観測性の欠如** | マスター側の thinking にはマスターの推論とツール呼び出ししか出ない。**サブエージェント内部の推論・ツール利用は見えない** | 障害調査時はサブエージェントを直接 SELECT で叩いて切り分ける手順を用意する |
+| **レイテンシの累積** | 総応答時間はサブエージェントの実行時間に依存。サブ側が複数ツールを呼ぶと待ち時間が積み上がる | 体感レイテンシの許容値をあらかじめ合意する。長時間処理は Async Agent API の GA を待つ |
+| **PAT の失効** | PAT には有効期限がある | 失効監視とローテーション手順を運用設計に含める |
+| **会話コンテキスト** | UDF は 1 問 1 答。サブエージェント側の Thread を維持しない | マルチターンが必要なら thread_id を UDF 引数に追加する拡張が必要 |
+| **ネットワークポリシー** | アカウントにネットワークポリシーがある場合、エージェントの通信がブロックされることがある | `SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT;` で事前確認 |
+
+#### 7.8.4 トラブルシューティング
+
+| エラー | 原因 | 対処 |
+|---|---|---|
+| `Could not read secret` | シークレットへの GRANT 不足 | `GRANT READ ON SECRET ... TO ROLE ...` |
+| `API Error 401` | PAT が無効／失効 | PAT を再発行しシークレットを更新 |
+| `API Error 403` | ロールにサブエージェントの USAGE がない | `SHOW GRANTS ON AGENT ...` で確認 |
+| `Connection error` | ネットワークルールの設定漏れ | `VALUE_LIST` にアカウント URL が含まれるか確認 |
+| `Agent returned no text` | サブエージェントの構成不備 | Snowsight でサブエージェントを直接テスト |
+| ツールが呼ばれない | オーケストレーション指示が曖昧 | ルーティング指示を具体化し「自分で答えるな」を明記 |
+
+---
+
+### 7.9 その他のパターン
+
+| パターン | 概要 | 使いどころ | 注意点 |
+|---|---|---|---|
+| **B. MCP connector** | サブエージェント側を MCP サーバとして公開し、親が MCP connector で呼ぶ。Cortex Agents は Jira・Salesforce・自社アプリなどリモート MCP サーバのツールを発見・実行できる | Snowflake 外のオーケストレーター（例: Microsoft AI Foundry）と組み合わせる場合、クロスプラットフォーム構成 | MCP サーバの運用が別途必要 |
+| **C. 外部フレームワーク** | LangGraph などの Supervisor アーキテクチャから Cortex Agents を呼ぶ | 複雑な状態遷移・条件分岐・評価ループが必要な場合 | オーケストレーションが Snowflake のガバナンス境界の外に出る |
+| **D. A2A プロトコル** | Cortex Agent を A2A（Agent-to-Agent）ラッパー経由で公開し、他ベンダーのエージェントと相互運用。A2A のディスカバリ機構により相手側は Snowflake を意識しなくてよい | マルチベンダー環境、他社エージェントとの連携 | ラッパーの実装・運用が必要。認証は鍵ペア＋JWT |
+
+---
+
+### 7.10 パターン選定 — 判断フローと比較
+
+```mermaid
+flowchart TD
+    Q0{"レベル1（単一Agent＋複数ツール）で<br/>要件を満たせないか？"}
+    Q0 -->|"満たせる"| Z["まずレベル1で構築<br/>★最優先で検討"]
+    Q0 -->|"満たせない"| Q
+
+    Q{"何が足りないのか"}
+    Q -->|"ツール定義の重複を解消したいだけ"| A["Agent Toolset<br/>type: agent_toolset"]
+    Q -->|"スキル（指示＋スクリプト）を共有したい"| B["Skills Package"]
+    Q -->|"ドメインごとに指示・モデル・トーンを変えたい"| C["階層型オーケストレーション<br/>UDF経由・パターンA"]
     Q -->|"Snowflake外のエージェントと連携したい"| D["MCP connector / A2A<br/>パターンB・D"]
-    Q -->|"複雑な状態遷移・条件分岐・評価ループ"| E["外部フレームワーク<br/>LangGraph等のSupervisor構成<br/>パターンC"]
+    Q -->|"複雑な状態遷移・条件分岐・評価ループ"| E["外部フレームワーク<br/>LangGraph等・パターンC"]
 
-    A --> A1["ツールのみ継承<br/>instructions・modelsは共有不可"]
-    C --> C1["PAT所有者の権限で動作<br/>RBAC設計に注意"]
+    A --> A1["⚠ instructions・models は共有不可<br/>⚠ サイレントスキップ対策が必須"]
+    C --> C1["⚠ PAT所有者の権限で動作<br/>⚠ サブAgent内部が可観測でない"]
 
+    style Z fill:#d4edda,stroke:#28a745,stroke-width:2px
     style A fill:#d4edda,stroke:#28a745,stroke-width:2px
     style C fill:#fff3cd,stroke:#ffc107
     style A1 fill:#f8f9fa,stroke:#adb5bd
     style C1 fill:#f8f9fa,stroke:#adb5bd
 ```
 
+| 観点 | レベル1<br/>単一Agent | Agent Toolset | 階層型（UDF） | 外部フレームワーク |
+|---|---|---|---|---|
+| 実装コスト | 低 | 低 | 中 | 高 |
+| ガバナンス境界 | Snowflake 内 | Snowflake 内 | Snowflake 内 | 外に出る |
+| RBAC の一貫性 | ✅ 保たれる | ✅ 保たれる | ❌ PAT 所有者権限 | ❌ 実装依存 |
+| 指示・モデルの分離 | ❌ | ❌ | ✅ | ✅ |
+| ツール定義の一元管理 | — | ✅ | △（別途必要） | △ |
+| 可観測性 | ✅ | ✅ | ❌ サブ側が見えない | 実装依存 |
+| レイテンシ | 低 | 低 | 高（累積） | 高 |
+| 成熟度 | GA | プレビュー | 回避策 | 外部依存 |
+
+**推奨する意思決定順序:**
+
+1. まず**レベル1**で PoC を作り、精度が出ない原因が「ツールが足りない」のか「指示が曖昧」なのかを切り分ける
+2. エージェントが 3 体以上になり、ツール定義の重複が管理コストになったら **Agent Toolset** を導入
+3. ドメインごとの応答スタイル・モデル使い分けが要件として明確になったときに初めて**階層型**を検討し、RBAC の制約をクライアントに説明する
+
+---
+
 ### ✅ 手を動かすチェックリスト（7章）
 
-- [ ] 自アカウントで `agent_toolset` が利用可能か確認した（プレビュー状況の確認）
-- [ ] ツールキットエージェント＋参照側エージェントの 2 つを作成した
-- [ ] 参照側から継承ツールが実際に呼ばれることを Playground で確認した
-- [ ] **参照先の USAGE を revoke し、エラーにならずツールが消えることを再現した**（サイレントスキップの体感）
-- [ ] 同名ツールをローカル定義してオーバーライドされることを確認した
-- [ ] `CORTEX_AGENT_TOOLSET_MAX_DEPTH` / `_MAX_AGENTS` の現在値を確認した
+**Agent Toolset**
+
+- [ ] `SHOW PARAMETERS LIKE 'CORTEX_AGENT_TOOLSET%' IN ACCOUNT;` で利用可否と上限値を確認した
+- [ ] ツールキットエージェント＋業務エージェントの 2 体を作成した
+- [ ] 業務エージェントの Playground で、継承ツールが実際に呼ばれることを thinking ステップで確認した
+- [ ] **参照先の USAGE を revoke し、エラーにならずツールだけが消えることを再現した**（最重要）
+- [ ] 同名ツールをローカル定義し、オーバーライドされることを確認した
+- [ ] 2 つのツールキットを参照し、名前衝突時に先勝ちすることを確認した
+- [ ] A → B → A の循環を作り、実行エラーになることを確認した
+
+**階層型オーケストレーション**
+
+- [ ] Network Rule / Secret / External Access Integration を作成した
+- [ ] サブエージェント呼び出し UDF を作成し、`SELECT ask_xxx_agent('...')` で単体テストした
+- [ ] マスターエージェントに Custom tool として登録し、ルーティングが働くことを確認した
+- [ ] マスター側の thinking にサブエージェント内部の推論が出ないことを確認した（可観測性の限界を体感）
+- [ ] レイテンシを計測し、レベル1構成との差を把握した
 
 ---
 
@@ -1010,8 +1492,9 @@ GROUP BY 1, 2 ORDER BY 2 DESC;
 | 6 | Cortex Analyst の REST 呼び出し・精度改善 | 精度改善の Before/After 比較 |
 | 7 | Cortex Agents 構築（Analyst + Search） | エージェント 1 体 |
 | 8 | Thread / ストリーミング / 監視 | REST クライアント実装 |
-| 9 | **Agent Toolset でマルチエージェント構成** | ツールキット + 業務エージェント |
-| 10 | 評価・コスト分析・ガバナンス整理 | 設計レビュー資料 |
+| 9 | **Agent Toolset でツール共有構成**（7.1〜7.7） | ツールキット + 業務エージェント、落とし穴の再現ログ |
+| 10 | **階層型オーケストレーション**（7.8）＋パターン選定 | マスター + サブエージェント、パターン比較資料 |
+| 11 | 評価・コスト分析・ガバナンス整理 | 設計レビュー資料 |
 
 ### 案件投入前に自問すべき 5 つの問い
 
