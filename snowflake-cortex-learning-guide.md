@@ -29,24 +29,44 @@
 
 初学者が最初につまずくのは「Cortex ＝ 何を指すのか」が曖昧な点です。Cortex は Snowflake の AI 機能群の総称であり、**下から積み上がる 4 層**として理解すると整理できます。
 
-```
-┌─────────────────────────────────────────────────────────┐
-│ L4 UI/体験層                                             │
-│    Snowflake Intelligence / Snowflake CoWork / Cortex Code│
-│    （エンドユーザーがチャットで使う画面）                  │
-├─────────────────────────────────────────────────────────┤
-│ L3 オーケストレーション層                                  │
-│    Cortex Agents                                         │
-│    （Plan → Use tools → Reflect のループを回す）           │
-├─────────────────────────────────────────────────────────┤
-│ L2 検索・分析エンジン層（＝Agent の「道具」）               │
-│    Cortex Analyst（構造化 / Text-to-SQL）                 │
-│    Cortex Search（非構造 / ハイブリッド検索・RAG）         │
-├─────────────────────────────────────────────────────────┤
-│ L1 モデル推論層                                           │
-│    Cortex AISQL（AI_COMPLETE, AI_CLASSIFY, AI_EXTRACT …） │
-│    OpenAI / Anthropic / Meta / Mistral / DeepSeek のモデル │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph L4["L4 ─ UI・体験層（エンドユーザーが触る画面）"]
+        direction LR
+        UI1["Snowflake<br/>Intelligence"]
+        UI2["Snowflake<br/>CoWork"]
+        UI3["Cortex Code"]
+    end
+
+    subgraph L3["L3 ─ オーケストレーション層"]
+        AG["Cortex Agents<br/>Plan → Use tools → Reflect のループ"]
+    end
+
+    subgraph L2["L2 ─ 検索・分析エンジン層（Agent の道具）"]
+        direction LR
+        AN["Cortex Analyst<br/>構造化データ / Text-to-SQL<br/>Semantic View が前提"]
+        SE["Cortex Search<br/>非構造データ<br/>ハイブリッド検索・RAG"]
+    end
+
+    subgraph L1["L1 ─ モデル推論層"]
+        direction LR
+        AI["Cortex AISQL<br/>AI_COMPLETE / AI_CLASSIFY<br/>AI_EXTRACT / AI_AGG ほか"]
+        MD["ホストされる LLM<br/>OpenAI / Anthropic / Meta<br/>Mistral / DeepSeek"]
+    end
+
+    UI1 --> AG
+    UI2 --> AG
+    UI3 --> AG
+    AG --> AN
+    AG --> SE
+    AN --> AI
+    SE --> AI
+    AI --> MD
+
+    style AG fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style AN fill:#e8f5e9,stroke:#28a745
+    style SE fill:#e8f5e9,stroke:#28a745
+    style AI fill:#fff3cd,stroke:#ffc107
 ```
 
 ### 各レイヤの責務
@@ -444,6 +464,27 @@ Cortex Agents は、**Snowflake のガバナンス境界内で動くフルマネ
 2. **Use tools** — 選択したツールを実行
 3. **Reflect and respond** — 結果を評価し、追加質問・別ツール呼び出し・最終回答のいずれかを決定
 
+```mermaid
+flowchart LR
+    IN(["ユーザーの質問"]) --> P
+
+    subgraph LOOP["エージェント推論ループ（1リクエスト内で必要なだけ反復）"]
+        direction LR
+        P["1. Plan<br/>曖昧な質問の明確化<br/>サブタスクへの分解<br/>ツールの割り当て"]
+        T["2. Use tools<br/>Cortex Analyst<br/>Cortex Search<br/>Code execution ほか"]
+        R["3. Reflect<br/>結果を評価し次を決定"]
+        P --> T --> R
+        R -->|"追加のツール呼び出しが必要"| P
+    end
+
+    R -->|"確認が必要"| ASK(["ユーザーへの確認質問"])
+    R -->|"十分な情報が揃った"| OUT(["最終回答＋引用・グラフ"])
+
+    style P fill:#e3f2fd,stroke:#1976d2
+    style T fill:#e8f5e9,stroke:#28a745
+    style R fill:#fff3cd,stroke:#ffc107
+```
+
 このループが 1 リクエスト内で必要に応じて繰り返されます。
 
 ### 6.2 主要概念
@@ -623,14 +664,52 @@ curl -X POST "$SNOWFLAKE_ACCOUNT_BASE_URL/api/v2/databases/CORTEX_LAB/schemas/CO
 4. 抽出したツールを呼び出し側の実効構成に **union（合成）**
 5. **展開済みのフラットなツール一覧**をオーケストレーターに渡す。`agent_toolset` エントリ自体は除去される
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as ユーザー
+    participant CA as 呼び出し側Agent
+    participant SF as Snowflake<br/>解決エンジン
+    participant RA as 参照先Agent<br/>（ツールキット）
+    participant OR as オーケストレーター<br/>（LLM）
+
+    U->>CA: 質問
+    CA->>SF: agent_toolset を検出
+    SF->>SF: tool_resources[name].agent_name を読む
+    SF->>RA: 完全修飾名で解決 ＋ 呼び出しユーザーのロールで USAGE 認可
+    RA-->>SF: tools / tool_resources のみ返す<br/>（models・instructions は返さない）
+    SF->>SF: 呼び出し側の実効構成に union（合成）
+    SF->>OR: 平坦化済みツール一覧を渡す<br/>（agent_toolset エントリは除去）
+    OR-->>U: 回答
 ```
-【誤解しているイメージ】              【実際の挙動】
-  親Agent                              呼び出し側Agent
-    └─▶ 子Agent（自分のLLM・指示で           tools: [local_tool,
-          考えて回答を返す）                          (継承)analyst_x,
-                                                     (継承)search_y]
-                                       ↑ 参照先のモデル・instructions は
-                                         継承されない。ツールだけが平坦化される
+
+**「委譲」ではなく「継承」であることを図で押さえる:**
+
+```mermaid
+flowchart LR
+    subgraph BAD["❌ 誤解しているイメージ：サブエージェントへの委譲"]
+        direction TB
+        P1["親 Agent"]
+        C1["子 Agent<br/>自分の LLM と instructions で<br/>推論して回答を返す"]
+        P1 -->|"質問を丸投げ"| C1
+        C1 -->|"回答"| P1
+    end
+
+    subgraph GOOD["✅ 実際の挙動：ツール定義の継承・平坦化"]
+        direction TB
+        CA2["呼び出し側 Agent<br/>local_tool"]
+        RA2["参照先 Agent<br/>analyst_x / search_y"]
+        EFF["実効ツール一覧<br/>local_tool<br/>analyst_x（継承）<br/>search_y（継承）"]
+        DROP["models<br/>instructions"]
+        CA2 --> EFF
+        RA2 -->|"tools / tool_resources を抽出"| EFF
+        RA2 -.->|"継承されない"| DROP
+    end
+
+    style BAD fill:#fdecea,stroke:#dc3545
+    style GOOD fill:#e8f5e9,stroke:#28a745
+    style EFF fill:#d4edda,stroke:#28a745,stroke-width:2px
+    style DROP fill:#f8d7da,stroke:#dc3545,stroke-dasharray: 4 4
 ```
 
 **設計上の含意（実務で効く）:**
@@ -847,23 +926,23 @@ $$;
 
 ### 7.7 判断フローチャート
 
-```
-複数のエージェント構成が必要か？
-  │
-  ├─ ツール定義の重複を解消したいだけ
-  │     → Agent Toolset（agent_toolset）  ★ 最もシンプル・低コスト
-  │
-  ├─ スキル（指示＋スクリプト）を共有したい
-  │     → Skills Package
-  │
-  ├─ ドメインごとに指示・モデル・トーンを変えたい
-  │     → UDF 経由の階層型オーケストレーション（パターン A）
-  │
-  ├─ Snowflake 外のエージェント／プラットフォームと連携したい
-  │     → MCP connector（パターン B）／ A2A（パターン D）
-  │
-  └─ 複雑な状態遷移・条件分岐・評価ループが必要
-        → LangGraph 等の外部フレームワーク（パターン C）
+```mermaid
+flowchart TD
+    Q{"複数のエージェント構成が必要か"}
+
+    Q -->|"ツール定義の重複を解消したいだけ"| A["Agent Toolset<br/>type: agent_toolset<br/>★最もシンプル・低コスト"]
+    Q -->|"スキル（指示＋スクリプト）を共有したい"| B["Skills Package<br/>単一URIでスキル群を参照"]
+    Q -->|"ドメインごとに指示・モデル・トーンを変えたい"| C["階層型オーケストレーション<br/>UDF経由で子Agentを呼ぶ<br/>パターンA"]
+    Q -->|"Snowflake外のエージェントと連携したい"| D["MCP connector / A2A<br/>パターンB・D"]
+    Q -->|"複雑な状態遷移・条件分岐・評価ループ"| E["外部フレームワーク<br/>LangGraph等のSupervisor構成<br/>パターンC"]
+
+    A --> A1["ツールのみ継承<br/>instructions・modelsは共有不可"]
+    C --> C1["PAT所有者の権限で動作<br/>RBAC設計に注意"]
+
+    style A fill:#d4edda,stroke:#28a745,stroke-width:2px
+    style C fill:#fff3cd,stroke:#ffc107
+    style A1 fill:#f8f9fa,stroke:#adb5bd
+    style C1 fill:#f8f9fa,stroke:#adb5bd
 ```
 
 ### ✅ 手を動かすチェックリスト（7章）
